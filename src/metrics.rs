@@ -10,27 +10,6 @@ use crate::types::*;
 use core_foundation_sys::dictionary::{CFDictionaryRef, CFMutableDictionaryRef};
 use std::time::{Duration, Instant};
 
-// ── Power estimation constants ───────────────────────────────────────────────
-
-/// Max display power at 100% brightness (built-in Liquid Retina XDR)
-pub const MAX_DISPLAY_W: f32 = 5.0;
-/// Max keyboard backlight power at 100%
-pub const MAX_KEYBOARD_W: f32 = 0.5;
-/// Max single-fan power at full RPM (cubic model)
-pub const MAX_FAN_W: f32 = 1.0;
-/// Audio DAC/amp idle power when device is open
-pub const AUDIO_IDLE_W: f32 = 0.05;
-/// Max speaker power at full volume
-pub const MAX_SPEAKER_W: f32 = 1.0;
-/// BT audio device power (headphones, speakers)
-pub const BT_AUDIO_DEVICE_W: f32 = 0.05;
-/// BT peripheral power (keyboard, mouse, etc.)
-pub const BT_PERIPHERAL_W: f32 = 0.01;
-/// SSD idle power
-pub const SSD_IDLE_W: f32 = 0.03;
-/// SSD max active power under heavy I/O
-pub const SSD_MAX_ACTIVE_W: f32 = 2.5;
-
 // ── CoreGraphics for display ID ──────────────────────────────────────────────
 
 #[link(name = "CoreGraphics", kind = "framework")]

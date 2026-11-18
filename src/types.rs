@@ -1,5 +1,47 @@
 use serde::Serialize;
 
+// ── Power estimation constants ───────────────────────────────────────────────
+
+/// Max display power at 100% brightness (built-in Liquid Retina XDR)
+pub const MAX_DISPLAY_W: f32 = 5.0;
+/// Max keyboard backlight power at 100%
+pub const MAX_KEYBOARD_W: f32 = 0.5;
+/// Max single-fan power at full RPM (cubic model)
+pub const MAX_FAN_W: f32 = 1.0;
+/// Audio DAC/amp idle power when device is open
+pub const AUDIO_IDLE_W: f32 = 0.05;
+/// Max speaker power at full volume
+pub const MAX_SPEAKER_W: f32 = 1.0;
+/// BT audio device power (headphones, speakers)
+pub const BT_AUDIO_DEVICE_W: f32 = 0.05;
+/// BT peripheral power (keyboard, mouse, etc.)
+pub const BT_PERIPHERAL_W: f32 = 0.01;
+/// SSD idle power
+pub const SSD_IDLE_W: f32 = 0.03;
+/// SSD max active power under heavy I/O
+pub const SSD_MAX_ACTIVE_W: f32 = 2.5;
+
+/// Category for an SMC temperature key (e.g. `Tp0C` -> "CPU"). Longer prefixes first.
+pub fn temp_category(key: &str) -> &'static str {
+    const PREFIXES: &[(&str, &str)] = &[
+        ("TPMP", "Trackpad"),
+        ("TPSP", "Trackpad"),
+        ("TD", "Display"),
+        ("Tp", "CPU"),
+        ("Te", "CPU"),
+        ("Tg", "GPU"),
+        ("Ts", "SSD"),
+        ("Tm", "Memory"),
+        ("TB", "Battery"),
+        ("Tw", "Wireless"),
+        ("Ta", "ANE"),
+    ];
+    PREFIXES
+        .iter()
+        .find(|(p, _)| key.starts_with(p))
+        .map_or("Other", |(_, c)| c)
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Metrics {
     pub soc: SocPower,

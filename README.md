@@ -56,6 +56,18 @@ Real-time power consumption monitor for Apple Silicon Macs (M1–M5+).
 - **JSON mode** — pipe structured data for scripts and dashboards
 - **No sudo** — runs entirely with user-level permissions
 
+## Linux (Asahi / Aurora)
+
+On Apple Silicon Macs running an Asahi-based kernel, macpow reads sysfs/procfs instead
+(`src/linux.rs`): SMC temps, fans and power rails via `macsmc_hwmon`, battery/AC via
+`macsmc-battery`/`macsmc-ac`, CPU usage and clusters via `/proc/stat` + cpufreq, GPU
+util/frequency via the aurora driver's `agx_stats`, backlight, keyboard LED, Wi-Fi (`iw`),
+network, NVMe and memory. No root needed.
+
+Not available yet on Linux: per-block SoC energy (CPU/GPU/ANE/DRAM watts show 0; the SoC
+total is the SMC heatpipe rail), per-process power is that total split by CPU time,
+and no Bluetooth/USB/audio/power-assertion rows. `--dump` and `--dump-smc` are macOS-only.
+
 ## Install
 
 ### With cargo

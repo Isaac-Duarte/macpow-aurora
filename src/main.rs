@@ -1,5 +1,8 @@
 mod app;
 
+#[cfg(target_os = "linux")]
+use macpow::linux::Sampler;
+#[cfg(target_os = "macos")]
 use macpow::metrics::Sampler;
 use macpow::types::Metrics;
 
@@ -44,6 +47,7 @@ fn main() -> Result<()> {
     let interval = args.interval;
     let json_mode = args.json;
 
+    #[cfg(target_os = "macos")]
     if args.dump {
         match macpow::ioreport::IOReportSampler::new() {
             Ok(ior) => ior.dump_channels(),
@@ -52,8 +56,13 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    #[cfg(target_os = "macos")]
     if args.dump_smc {
         return run_dump_smc();
+    }
+    #[cfg(target_os = "linux")]
+    if args.dump || args.dump_smc {
+        anyhow::bail!("--dump/--dump-smc are macOS-only; on Linux see /sys/class/hwmon/*/");
     }
 
     let (tx, rx) = mpsc::sync_channel::<Metrics>(2);
@@ -148,6 +157,7 @@ extern "C" fn sigint_handler(_: libc::c_int) {
 
 /// Dump every SMC key in the same format as `iSMC raw`, so the output can be
 /// diffed against existing dumps in `dkorunic/iSMC/reports/`.
+#[cfg(target_os = "macos")]
 fn run_dump_smc() -> Result<()> {
     let mut smc =
         macpow::smc::SmcConnection::open().map_err(|e| anyhow::anyhow!("SMC open failed: {e}"))?;

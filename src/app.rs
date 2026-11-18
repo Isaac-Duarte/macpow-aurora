@@ -1,3 +1,4 @@
+#[cfg(target_os = "macos")]
 use macpow::process_utils::command_output_timeout;
 use macpow::sma::TimeSma;
 use macpow::types::*;
@@ -3437,6 +3438,16 @@ fn proc_key(cache: &mut std::collections::HashMap<i32, &'static str>, pid: i32) 
         .or_insert_with(|| Box::leak(format!("pid.{}", pid).into_boxed_str()))
 }
 
+#[cfg(target_os = "linux")]
+fn read_machine_name() -> String {
+    std::fs::read_to_string("/proc/device-tree/model")
+        .map(|s| s.trim_end_matches('\0').trim().to_string())
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Mac".into())
+}
+
+#[cfg(target_os = "macos")]
 fn read_machine_name() -> String {
     let chip = command_output_timeout(
         "sysctl",

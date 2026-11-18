@@ -506,21 +506,6 @@ impl SmcConnection {
     }
 
     fn discover_temp_keys(&mut self) -> Vec<(String, String)> {
-        // Longer prefixes first: TPMP/TPSP must match before Tp (CPU)
-        let prefixes: &[(&str, &str)] = &[
-            ("TPMP", "Trackpad"),
-            ("TPSP", "Trackpad"),
-            ("TD", "Display"),
-            ("Tp", "CPU"),
-            ("Te", "CPU"),
-            ("Tg", "GPU"),
-            ("Ts", "SSD"),
-            ("Tm", "Memory"),
-            ("TB", "Battery"),
-            ("Tw", "Wireless"),
-            ("Ta", "ANE"),
-        ];
-
         let count = self.key_count();
         (0..count)
             .filter_map(|i| {
@@ -529,11 +514,7 @@ impl SmcConnection {
                 let key_str = fourcc_to_str(key_fcc);
                 let info = self.read_key_info(key_fcc).ok()?;
                 matches!(info.data_type, TYPE_FLT | TYPE_IOF | TYPE_SP78).then_some(())?;
-                let category = prefixes
-                    .iter()
-                    .find(|(p, _)| key_str.starts_with(p))
-                    .map(|(_, c)| c.to_string())
-                    .unwrap_or_else(|| "Other".into());
+                let category = crate::types::temp_category(&key_str).to_string();
                 Some((key_str, category))
             })
             .collect()
@@ -556,7 +537,7 @@ impl SmcConnection {
                 let max = self.read_f32(&format!("F{}Mx", i)).unwrap_or(0.0);
                 let power = if max > 0.0 {
                     let ratio = (actual / max).clamp(0.0, 1.0);
-                    crate::metrics::MAX_FAN_W * ratio.powi(3)
+                    crate::types::MAX_FAN_W * ratio.powi(3)
                 } else {
                     0.0
                 };
