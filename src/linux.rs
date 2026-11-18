@@ -394,6 +394,223 @@ fn read_wifi() -> WifiInfo {
     info
 }
 
+// ── Desktop / userspace services (subprocesses, polled on the slow thread) ──
+
+fn run_cmd(cmd: &str, args: &[&str]) -> Option<String> {
+    command_output_timeout(cmd, args, Duration::from_millis(1000))
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// Connected BlueZ devices with battery levels, from one D-Bus ObjectManager call.
+fn read_bluetooth() -> Vec<BluetoothDevice> {
+    let Some(out) = run_cmd(
+        "busctl",
+        &[
+            "--system",
+            "--json=short",
+            "call",
+            "org.bluez",
+            "/",
+            "org.freedesktop.DBus.ObjectManager",
+            "GetManagedObjects",
+        ],
+    ) else {
+        return Vec::new();
+    };
+    parse_bluez_objects(&out)
+}
+
+fn parse_bluez_objects(json: &str) -> Vec<BluetoothDevice> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(objs) = v["data"][0].as_object() else {
+        return Vec::new();
+    };
+    let mut devs: Vec<BluetoothDevice> = objs
+        .values()
+        .filter_map(|ifaces| {
+            let dev = ifaces.get("org.bluez.Device1")?;
+            (dev["Connected"]["data"].as_bool() == Some(true)).then_some(())?;
+            let name = dev["Alias"]["data"]
+                .as_str()
+                .or(dev["Name"]["data"].as_str())?
+                .to_string();
+            // Icon is freedesktop-style, e.g. "audio-headset" -> "headset".
+            let minor_type = dev["Icon"]["data"]
+                .as_str()
+                .map(|i| i.rsplit('-').next().unwrap_or(i).to_string())
+                .unwrap_or_default();
+            let batteries = ifaces["org.bluez.Battery1"]["Percentage"]["data"]
+                .as_u64()
+                .map(|p| vec![(String::new(), format!("{p}%"))])
+                .unwrap_or_default();
+            Some(BluetoothDevice {
+                name,
+                minor_type,
+                connected: true,
+                batteries,
+            })
+        })
+        .collect();
+    devs.sort_by(|a, b| a.name.cmp(&b.name));
+    devs
+}
+
+/// Default sink volume/mute (wpctl) and state (pactl), same power model as macOS.
+fn read_audio() -> AudioInfo {
+    let (volume_pct, muted) = run_cmd("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"])
+        .map(|s| {
+            let vol = s
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<f32>().ok())
+                .map(|v| v * 100.0);
+            (vol, s.contains("[MUTED]"))
+        })
+        .unwrap_or((None, false));
+    let default = run_cmd("pactl", &["get-default-sink"]).unwrap_or_default();
+    let state = run_cmd("pactl", &["list", "sinks", "short"])
+        .and_then(|s| {
+            s.lines().find_map(|l| {
+                let f: Vec<&str> = l.split('\t').collect();
+                (f.get(1) == Some(&default.trim())).then(|| f.last().unwrap_or(&"").to_string())
+            })
+        })
+        .unwrap_or_default();
+    let device_active = !state.is_empty() && state != "SUSPENDED";
+    let playing = state == "RUNNING";
+    let vol = if muted {
+        0.0
+    } else {
+        volume_pct.unwrap_or(0.0) / 100.0
+    };
+    AudioInfo {
+        volume_pct,
+        muted,
+        device_active,
+        playing,
+        estimated_power_w: match (device_active, playing) {
+            (false, _) => 0.0,
+            (true, true) => AUDIO_IDLE_W + vol * vol * MAX_SPEAKER_W,
+            (true, false) => AUDIO_IDLE_W,
+        },
+    }
+}
+
+/// (refresh Hz, HDR on) of the built-in panel.
+/// shortcut: uses KDE's kscreen-doctor (needs WAYLAND_DISPLAY); read DRM CRTC state via ioctl for other desktops.
+fn read_panel_mode() -> Option<(f32, bool)> {
+    let v: serde_json::Value = serde_json::from_str(&run_cmd("kscreen-doctor", &["-j"])?).ok()?;
+    let out = v["outputs"].as_array()?.iter().find(|o| {
+        o["enabled"].as_bool() == Some(true)
+            && o["name"].as_str().is_some_and(|n| n.starts_with("eDP"))
+    })?;
+    let cur = out["currentModeId"].as_str()?;
+    let hz = out["modes"]
+        .as_array()?
+        .iter()
+        .find(|m| m["id"].as_str() == Some(cur))?["refreshRate"]
+        .as_f64()?;
+    Some((hz as f32, out["hdr"].as_bool().unwrap_or(false)))
+}
+
+/// Per-process cumulative TCP bytes (rx, tx) over currently open sockets.
+/// Without root, `ss` only attributes our own processes' sockets.
+fn read_proc_net() -> HashMap<i32, (u64, u64)> {
+    run_cmd("ss", &["-tinpH"])
+        .map(|s| parse_ss(&s))
+        .unwrap_or_default()
+}
+
+fn parse_ss(out: &str) -> HashMap<i32, (u64, u64)> {
+    let mut map: HashMap<i32, (u64, u64)> = HashMap::new();
+    let mut pids: Vec<i32> = Vec::new();
+    for line in out.lines() {
+        if !line.starts_with(char::is_whitespace) {
+            pids = line
+                .split("pid=")
+                .skip(1)
+                .filter_map(|p| p.split(',').next()?.parse().ok())
+                .collect();
+            continue;
+        }
+        let field = |k: &str| {
+            line.split_whitespace()
+                .find_map(|f| f.strip_prefix(k)?.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        let (rx, tx) = (field("bytes_received:"), field("bytes_acked:"));
+        // A socket shared by several processes (fork) counts once, for the first pid.
+        if let Some(&pid) = pids.first() {
+            let e = map.entry(pid).or_default();
+            e.0 += rx;
+            e.1 += tx;
+        }
+    }
+    map
+}
+
+/// USB devices from sysfs (root hubs and interfaces skipped).
+fn read_usb_devices() -> Vec<UsbDevice> {
+    let Ok(rd) = fs::read_dir("/sys/bus/usb/devices") else {
+        return Vec::new();
+    };
+    let mut devs: Vec<UsbDevice> = rd
+        .flatten()
+        .filter_map(|e| {
+            let id = e.file_name().into_string().ok()?;
+            // "1-2.3" is a device; "usb1" is a root hub, "1-2:1.0" an interface.
+            let (bus, ports) = id.split_once('-').filter(|_| !id.contains(':'))?;
+            let p = e.path();
+            let hex = |f: &str| u32::from_str_radix(&read(p.join(f))?, 16).ok();
+            let speed_mbps: f32 = num(p.join("speed")).unwrap_or(0.0);
+            Some(UsbDevice {
+                name: read(p.join("product")).unwrap_or_else(|| {
+                    format!(
+                        "{:04x}:{:04x}",
+                        hex("idVendor").unwrap_or(0),
+                        hex("idProduct").unwrap_or(0)
+                    )
+                }),
+                vendor_id: hex("idVendor")?,
+                product_id: hex("idProduct").unwrap_or(0),
+                power_ma: read(p.join("bMaxPower"))
+                    .and_then(|s| s.trim_end_matches("mA").parse().ok())
+                    .filter(|&ma: &u32| ma > 0),
+                speed: match speed_mbps as u32 {
+                    0..=2 => 0,
+                    3..=12 => 1,
+                    13..=480 => 2,
+                    481..=5000 => 3,
+                    5001..=10000 => 4,
+                    _ => 5,
+                },
+                location_id: usb_location_id(bus, ports),
+                parent_location_id: ports
+                    .rsplit_once('.')
+                    .map_or(0, |(parent, _)| usb_location_id(bus, parent)),
+                bytes_read: 0,
+                bytes_written: 0,
+            })
+        })
+        .collect();
+    devs.sort_by_key(|d| d.location_id);
+    devs
+}
+
+/// macOS-style location ID: bus in the top byte, one nibble per port hop ("2-1.3" -> 0x02130000).
+fn usb_location_id(bus: &str, ports: &str) -> u32 {
+    let bus: u32 = bus.parse().unwrap_or(0);
+    ports
+        .split('.')
+        .filter_map(|p| p.parse::<u32>().ok())
+        .take(6)
+        .enumerate()
+        .fold(bus << 24, |acc, (i, p)| acc | ((p & 0xF) << (20 - 4 * i)))
+}
+
 // ── Disk ─────────────────────────────────────────────────────────────────────
 
 /// Total (read_bytes, write_bytes) over whole NVMe disks.
@@ -504,18 +721,38 @@ impl Sampler {
         let dt = Duration::from_millis(interval_ms.max(100));
         let mut handles = Vec::new();
 
-        // Wi-Fi/Ethernet: `iw` is a subprocess, so keep it off the fast loop.
+        let proc_net: Arc<Mutex<HashMap<i32, (u64, u64)>>> = Default::default();
+
+        // Everything that needs a subprocess (iw, busctl, wpctl, pactl, kscreen-doctor, ss)
+        // runs here, off the fast loop.
         {
             let m = shared.clone();
             let running = running.clone();
+            let proc_net = proc_net.clone();
             handles.push(std::thread::spawn(move || {
                 while running.load(Ordering::Relaxed) {
                     let wifi = read_wifi();
                     let eth = read_ethernet();
+                    let bt = read_bluetooth();
+                    let audio = read_audio();
+                    let panel = read_panel_mode();
+                    let usb = read_usb_devices();
+                    let net = read_proc_net();
+                    if let Ok(mut pn) = proc_net.lock() {
+                        *pn = net;
+                    }
                     if let Ok(mut mg) = m.lock() {
                         mg.wifi_power_w = wifi.estimated_power_w;
                         mg.wifi = wifi;
                         mg.ethernet = eth;
+                        mg.bluetooth_power_w = bt.len() as f32 * BT_PERIPHERAL_W;
+                        mg.bluetooth_devices = bt;
+                        mg.audio = audio;
+                        mg.usb_devices = usb;
+                        if let Some((hz, hdr)) = panel {
+                            mg.display.refresh_hz = hz;
+                            mg.display.hdr_active = hdr;
+                        }
                     }
                     std::thread::sleep(dt.max(Duration::from_secs(2)));
                 }
@@ -526,7 +763,7 @@ impl Sampler {
             let m = shared.clone();
             let running = running.clone();
             handles.push(std::thread::spawn(move || {
-                Self::run(m, running, dt);
+                Self::run(m, running, dt, proc_net);
             }));
         }
 
@@ -537,7 +774,12 @@ impl Sampler {
         }
     }
 
-    fn run(m: Arc<Mutex<Metrics>>, running: Arc<AtomicBool>, dt: Duration) {
+    fn run(
+        m: Arc<Mutex<Metrics>>,
+        running: Arc<AtomicBool>,
+        dt: Duration,
+        proc_net: Arc<Mutex<HashMap<i32, (u64, u64)>>>,
+    ) {
         let smc = hwmon_dir("macsmc_hwmon")
             .map(|d| list_sensors(&d))
             .unwrap_or_default();
@@ -684,6 +926,7 @@ impl Sampler {
 
             // Processes: split SoC power by each process's share of CPU time.
             let cur_procs = read_processes(page_size);
+            let net = proc_net.lock().map(|n| n.clone()).unwrap_or_default();
             let deltas: HashMap<i32, u64> = cur_procs
                 .iter()
                 .map(|(pid, s)| {
@@ -729,8 +972,8 @@ impl Sampler {
                     disk_read_bytes: s.read_bytes,
                     disk_write_bytes: s.write_bytes,
                     phys_mem_bytes: s.rss_bytes,
-                    net_rx_bytes: 0,
-                    net_tx_bytes: 0,
+                    net_rx_bytes: net.get(&pid).map_or(0, |n| n.0),
+                    net_tx_bytes: net.get(&pid).map_or(0, |n| n.1),
                 };
             }
             procs.retain(|_, p| now.duration_since(p.last_seen).as_secs() < 30);
@@ -787,7 +1030,12 @@ impl Sampler {
                     brightness_pct: kbd * 100.0,
                     estimated_power_w: kbd * MAX_KEYBOARD_W,
                 };
-                mg.display = display;
+                // refresh/HDR come from the slow thread; keep them.
+                mg.display = DisplayInfo {
+                    refresh_hz: mg.display.refresh_hz,
+                    hdr_active: mg.display.hdr_active,
+                    ..display
+                };
                 mg.top_processes = top;
                 mg.all_procs_power_w = total_sma.get();
                 mg.all_procs_energy_mj = total_energy;
@@ -821,6 +1069,27 @@ mod tests {
     fn usage_pct_handles_deltas_and_resets() {
         assert_eq!(usage_pct((100, 200), (150, 300)), 50.0);
         assert_eq!(usage_pct((1000, 2000), (10, 20)), 0.0);
+    }
+
+    #[test]
+    fn usb_location_ids_nest() {
+        assert_eq!(usb_location_id("2", "1.3"), 0x0213_0000);
+        assert_eq!(usb_location_id("1", "4"), 0x0140_0000);
+    }
+
+    #[test]
+    fn parse_ss_sums_per_pid() {
+        let out = "ESTAB 0 0 a:1 b:2 users:((\"curl\",pid=42,fd=3))\n\t cubic bytes_sent:10 bytes_acked:9 bytes_received:100\nESTAB 0 0 a:3 b:4 users:((\"curl\",pid=42,fd=4))\n\t cubic bytes_acked:1 bytes_received:5\n";
+        assert_eq!(parse_ss(out)[&42], (105, 10));
+    }
+
+    #[test]
+    fn parse_bluez_keeps_connected_with_battery() {
+        let json = r#"{"type":"a{oa{sa{sv}}}","data":[{"/org/bluez/hci0/dev_A":{"org.bluez.Device1":{"Name":{"type":"s","data":"WH-1000XM4"},"Icon":{"type":"s","data":"audio-headset"},"Connected":{"type":"b","data":true}},"org.bluez.Battery1":{"Percentage":{"type":"y","data":90}}},"/org/bluez/hci0/dev_B":{"org.bluez.Device1":{"Name":{"type":"s","data":"Off"},"Connected":{"type":"b","data":false}}}}]}"#;
+        let d = parse_bluez_objects(json);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].minor_type, "headset");
+        assert_eq!(d[0].batteries, vec![(String::new(), "90%".to_string())]);
     }
 
     #[test]

@@ -62,11 +62,14 @@ On Apple Silicon Macs running an Asahi-based kernel, macpow reads sysfs/procfs i
 (`src/linux.rs`): SMC temps, fans and power rails via `macsmc_hwmon`, battery/AC via
 `macsmc-battery`/`macsmc-ac`, CPU usage and clusters via `/proc/stat` + cpufreq, GPU
 util/frequency via the aurora driver's `agx_stats`, backlight, keyboard LED, Wi-Fi (`iw`),
-network, NVMe and memory. No root needed.
+network, NVMe and memory. Bluetooth (BlueZ via `busctl`), audio (`wpctl`/`pactl`), USB
+devices (sysfs), panel refresh/HDR (`kscreen-doctor`, KDE) and per-process TCP traffic
+(`ss`, own processes only). No root needed.
 
 Not available yet on Linux: per-block SoC energy (CPU/GPU/ANE/DRAM watts show 0; the SoC
 total is the SMC heatpipe rail), per-process power is that total split by CPU time,
-and no Bluetooth/USB/audio/power-assertion rows. `--dump` and `--dump-smc` are macOS-only.
+no USB-C port power out (the PD controllers only report online/offline), no USB I/O
+counters and no power assertions. `--dump` and `--dump-smc` are macOS-only.
 
 ## Install
 
